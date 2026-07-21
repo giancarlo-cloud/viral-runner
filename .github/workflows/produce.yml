@@ -1,0 +1,54 @@
+name: produce
+on:
+  schedule:
+    - cron: "20 5 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: viral-state
+  cancel-in-progress: false
+
+jobs:
+  produce:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - name: Check configuration
+        id: cfg
+        run: |
+          if [ -z "${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}" ] || [ -z "${{ secrets.RCLONE_CONF_B64 }}" ]; then
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "Cloud production not configured — run setup_cloud.sh on the Mac once. Mac fallback covers today."
+          else
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/checkout@v4
+        if: steps.cfg.outputs.configured == 'true'
+        with:
+          repository: giancarlo-cloud/viral-agent
+          token: ${{ secrets.GH_PAT }}
+      - name: Toolchain
+        if: steps.cfg.outputs.configured == 'true'
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg rclone
+          npm install -g @anthropic-ai/claude-code
+          mkdir -p ~/.config/rclone
+          echo "${{ secrets.RCLONE_CONF_B64 }}" | base64 -d > ~/.config/rclone/rclone.conf
+      - name: Produce daily replicas
+        if: steps.cfg.outputs.configured == 'true'
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          RCLONE_CONFIGURED: "true"
+        run: |
+          mkdir -p logs
+          python3 produce.py > "logs/produce-$(date -u +%F).log" 2>&1 || echo "exit $?" >> "logs/produce-$(date -u +%F).log"
+      - name: Commit state to private repo
+        if: steps.cfg.outputs.configured == 'true'
+        run: |
+          git config user.name "viral-runner"
+          git config user.email "actions@users.noreply.github.com"
+          git add -A data logs
+          git diff --cached --quiet || git commit -m "produce $(date -u +%F)"
+          git pull --rebase && git push
