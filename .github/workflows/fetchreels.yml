@@ -1,0 +1,31 @@
+name: fetch-reels
+on:
+  schedule:
+    - cron: "50 4 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: viral-state
+  cancel-in-progress: false
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: giancarlo-cloud/viral-agent
+          token: ${{ secrets.GH_PAT }}
+      - name: Run
+        run: |
+          pip install --quiet yt-dlp
+          mkdir -p logs
+          python3 produce.py --fetch-reels-only > "logs/fetch-$(date -u +%F).log" 2>&1 || echo "exit $?" >> "logs/fetch-$(date -u +%F).log"
+      - name: Commit state to private repo
+        run: |
+          git config user.name "viral-runner"
+          git config user.email "actions@users.noreply.github.com"
+          git add -A data media logs
+          git diff --cached --quiet || git commit -m "reels $(date -u +%F)"
+          git pull --rebase && git push
