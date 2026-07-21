@@ -1,0 +1,34 @@
+name: scan
+on:
+  schedule:
+    - cron: "20 4 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: viral-state
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: giancarlo-cloud/viral-agent
+          token: ${{ secrets.GH_PAT }}
+      # All output goes into the private repo — public logs stay content-free.
+      - name: Run
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          mkdir -p logs
+          python3 scrape.py > "logs/scan-$(date -u +%F).log" 2>&1 || echo "exit $?" >> "logs/scan-$(date -u +%F).log"
+      - name: Commit state to private repo
+        run: |
+          git config user.name "viral-runner"
+          git config user.email "actions@users.noreply.github.com"
+          git add -A data media logs
+          git diff --cached --quiet || git commit -m "scan $(date -u +%F)"
+          git pull --rebase && git push
