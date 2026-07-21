@@ -1,0 +1,22 @@
+name: pulse
+# Second independent cron registration for the private reminders workflow —
+# fires a dispatch shortly after each slot; the sender's own dedup makes
+# double-delivery impossible.
+on:
+  schedule:
+    - cron: "9 7,8,11,12,13,17,18 * * *"
+    - cron: "39 16,17,21,22 * * *"
+  workflow_dispatch:
+
+jobs:
+  nudge:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Dispatch reminders check
+        run: |
+          curl -s -o /dev/null -w "dispatch %{http_code}\n" -X POST \
+            -H "Authorization: token ${{ secrets.GH_PAT }}" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/giancarlo-cloud/topg-reminders/actions/workflows/reminders.yml/dispatches \
+            -d '{"ref":"main"}'
