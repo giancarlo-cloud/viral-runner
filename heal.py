@@ -1,24 +1,28 @@
 #!/usr/bin/env python3
 """Self-healing dispatcher for the daily viral pipeline.
 
-GitHub cron on this account skips slots unpredictably (2026-07-22: pulse fired,
-scan/fetch/produce all silently missed). This script makes any surviving
-trigger repair the whole day: for each stage past its UTC slot with no run yet
-today, dispatch it — waiting for upstream stages to finish first so the shared
-"viral-state" concurrency group never cancels a queued sibling.
+GitHub cron on this account skips slots unpredictably, and Instagram
+intermittently blocks runner IPs — so coverage is judged by OUTCOMES, not by
+"a run happened":
 
-Runs from: pulse workflow (GH_TOKEN env), Mac launchd watchdog (token file),
-or by hand. Idempotent — a stage that already ran today is never re-dispatched.
+  scan     covered when today's scan log is clean (no [SCAN BLOCKED]);
+           while blocked, each heal pass re-rolls a fresh runner IP (cap 6/day)
+  fetch    covered when a fetch run exists after the last clean scan
+  produce  covered when >=TARGET archive entries have replicated == today
+           (cap 4 runs/day; produce.py itself stops at the daily target)
+
+Stages dispatch in order; heal waits for scan/fetch to finish before the next
+stage so the shared "viral-state" concurrency group never cancels a queued
+sibling. Runs from: pulse workflow (GH_TOKEN env), Mac launchd watchdog
+(token file), or by hand. Telegrams whenever it takes an action.
 """
-import json, os, time, urllib.request
+import base64, json, os, time, urllib.request
 from datetime import datetime, timezone
 
-REPO = "giancarlo-cloud/viral-runner"
-STAGES = [  # (workflow file, UTC slot, wait for completion before next stage)
-    ("scan.yml", "04:20", True),
-    ("fetchreels.yml", "04:50", True),
-    ("produce.yml", "05:20", False),
-]
+RUNNER = "giancarlo-cloud/viral-runner"
+STATE = "giancarlo-cloud/viral-agent"
+TARGET = 3
+SCAN_CAP, FETCH_CAP, PRODUCE_CAP = 6, 6, 4
 WAIT_TIMEOUT = 1500
 
 
@@ -38,9 +42,21 @@ def _api(method, path):
         return json.loads(body) if body else None
 
 
+def _file(repo, path):
+    try:
+        d = _api("GET", f"/repos/{repo}/contents/{path}")
+        return base64.b64decode(d["content"]).decode()
+    except Exception:
+        return None
+
+
 def runs_today(wf, day):
-    d = _api("GET", f"/repos/{REPO}/actions/workflows/{wf}/runs?created=%3E%3D{day}&per_page=10")
+    d = _api("GET", f"/repos/{RUNNER}/actions/workflows/{wf}/runs?created=%3E%3D{day}&per_page=20")
     return d.get("workflow_runs", [])
+
+
+def dispatch(wf):
+    _api("POST", f"/repos/{RUNNER}/actions/workflows/{wf}/dispatches")
 
 
 def wait_done(wf, day):
@@ -68,29 +84,82 @@ def telegram(text):
         print(f"telegram failed: {e}")
 
 
+def shipped_today(day):
+    raw = _file(STATE, "data/archive.json")
+    if not raw:
+        return 0
+    return sum(1 for e in json.loads(raw).values() if e.get("replicated") == day)
+
+
+def latest_end(runs):
+    return max((r.get("updated_at", "") for r in runs), default="")
+
+
 def main():
     now = datetime.now(timezone.utc)
     day, hhmm = now.strftime("%Y-%m-%d"), now.strftime("%H:%M")
-    healed = []
-    for wf, slot, wait in STAGES:
-        if hhmm < slot:
-            print(f"{wf}: slot {slot} not reached yet — stopping")
-            break
-        runs = runs_today(wf, day)
-        if runs:
-            active = sum(1 for r in runs if r["status"] != "completed")
-            print(f"{wf}: covered today ({len(runs)} runs, {active} active)")
+    actions = []
+
+    # --- scan: clean log or re-roll ---
+    if hhmm < "04:20":
+        print("before first slot — nothing to do")
+        return
+    scan_runs = runs_today("scan.yml", day)
+    scan_log = _file(STATE, f"logs/scan-{day}.log") or ""
+    scan_clean = bool(scan_log) and "[SCAN BLOCKED]" not in scan_log
+    active = any(r["status"] != "completed" for r in scan_runs)
+    if scan_clean:
+        print(f"scan: clean ({len(scan_runs)} runs)")
+    elif active:
+        print("scan: run in progress — waiting")
+        wait_done("scan.yml", day)
+        scan_clean = "[SCAN BLOCKED]" not in (_file(STATE, f"logs/scan-{day}.log") or "")
+    elif len(scan_runs) >= SCAN_CAP:
+        print(f"scan: blocked all {len(scan_runs)} attempts — cap reached")
+    else:
+        dispatch("scan.yml")
+        actions.append(f"scan re-roll #{len(scan_runs) + 1} (IP blocked)"
+                       if scan_runs else "scan (missed slot)")
+        print(f"scan: dispatched (attempt {len(scan_runs) + 1})")
+        if wait_done("scan.yml", day):
+            scan_clean = "[SCAN BLOCKED]" not in (_file(STATE, f"logs/scan-{day}.log") or "")
+            print(f"scan: finished, clean={scan_clean}")
+
+    # --- fetch: must postdate the last clean scan ---
+    if hhmm >= "04:50":
+        fetch_runs = runs_today("fetchreels.yml", day)
+        scan_runs = runs_today("scan.yml", day)
+        need_fetch = not fetch_runs or (
+            scan_clean and latest_end(fetch_runs) < latest_end(scan_runs))
+        if need_fetch and len(fetch_runs) < FETCH_CAP:
+            if any(r["status"] != "completed" for r in scan_runs):
+                print("fetch: scan still active — next pulse handles it")
+            else:
+                dispatch("fetchreels.yml")
+                actions.append("fetch-reels")
+                print("fetch: dispatched")
+                wait_done("fetchreels.yml", day)
         else:
-            _api("POST", f"/repos/{REPO}/actions/workflows/{wf}/dispatches")
-            healed.append(wf.replace(".yml", ""))
-            print(f"{wf}: MISSED its {slot} slot — dispatched")
-        if wait and not wait_done(wf, day):
-            print(f"{wf}: still running after {WAIT_TIMEOUT}s — stopping to keep order")
-            break
-    if healed:
-        telegram(f"Watchdog {day}: GitHub cron missed {', '.join(healed)} — "
-                 "re-dispatched in order (pulse/Mac self-heal).")
-    print(f"healed: {healed or 'nothing — all on time'}")
+            print(f"fetch: covered ({len(fetch_runs)} runs)")
+
+    # --- produce: judged by shipped videos, not runs ---
+    if hhmm >= "05:20":
+        done = shipped_today(day)
+        produce_runs = runs_today("produce.yml", day)
+        if done >= TARGET:
+            print(f"produce: target met ({done}/{TARGET})")
+        elif any(r["status"] != "completed" for r in produce_runs):
+            print("produce: run in progress")
+        elif len(produce_runs) >= PRODUCE_CAP:
+            print(f"produce: {done}/{TARGET} shipped, cap {PRODUCE_CAP} reached")
+        else:
+            dispatch("produce.yml")
+            actions.append(f"produce ({done}/{TARGET} shipped so far)")
+            print(f"produce: dispatched (run #{len(produce_runs) + 1}, {done}/{TARGET} shipped)")
+
+    if actions:
+        telegram(f"Watchdog {day} {hhmm}Z: " + "; ".join(actions))
+    print(f"actions: {actions or 'none — all covered'}")
 
 
 if __name__ == "__main__":
