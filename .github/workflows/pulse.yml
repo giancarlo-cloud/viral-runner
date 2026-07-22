@@ -1,17 +1,22 @@
 name: pulse
-# Second independent cron registration for the private reminders workflow —
-# fires a dispatch shortly after each slot; the sender's own dedup makes
-# double-delivery impossible.
+# Watchdog cron. GitHub schedule events on this account skip slots
+# unpredictably, so pulse (whose cron demonstrably fires) repairs the day:
+#   1. nudges the private reminders workflow (sender dedups double-delivery)
+#   2. runs heal.py — dispatches any viral stage (scan/fetch/produce) that
+#      missed its slot today, in order, waiting between stages so the shared
+#      concurrency group never cancels a queued sibling.
+# Extra 05/06 UTC slots sit right after the stage slots (04:20-05:20) so a
+# missed morning is normally healed by 05:39.
 on:
   schedule:
-    - cron: "9 7,8,11,12,13,17,18 * * *"
-    - cron: "39 16,17,21,22 * * *"
+    - cron: "9 5,6,7,8,11,12,13,17,18 * * *"
+    - cron: "39 5,16,17,21,22 * * *"
   workflow_dispatch:
 
 jobs:
   nudge:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 40
     steps:
       - name: Dispatch reminders check
         run: |
@@ -20,3 +25,10 @@ jobs:
             -H "Accept: application/vnd.github+json" \
             https://api.github.com/repos/giancarlo-cloud/topg-reminders/actions/workflows/reminders.yml/dispatches \
             -d '{"ref":"main"}'
+      - uses: actions/checkout@v4
+      - name: Self-heal viral pipeline
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python3 heal.py
